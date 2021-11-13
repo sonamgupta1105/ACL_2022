@@ -1,0 +1,402 @@
+---
+title: "ob_RMD_LDA_binClass"
+author: "Sonam Gupta"
+date: "9/12/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Traditional LDA on Low and High Rated obgyn doctors
+
+```{r preprocess_data}
+library(quanteda)
+library(readr)
+library(BBmisc)
+library(dplyr)
+library(stringi)
+if(!require("topicmodels")) {install.packages("topicmodels"); library("topicmodels")}
+library(cld3)
+library(tm)
+library(tidytext)
+library(slam)
+
+# Read the data in
+rm_data <- read.csv("D:/Education/HbgUniv/PhD DS/Sex_bias_thesis/SexBias/Online_reviews/Multi-Aspect-Sentiment-Classification-for-Online-Medical-Reviews-main/RateMDs/Binary_classification_tm/rateMD_noDups.csv", stringsAsFactors = FALSE, encoding = 'Windows-1252')
+
+# Customized stopwords list used when building document term frequency matrix
+stopwordsPL <- readLines("D:/Education/HbgUniv/PhD DS/Sex_bias_thesis/SexBias/Online_reviews/Multi-Aspect-Sentiment-Classification-for-Online-Medical-Reviews-main/RateMDs/stopwords.txt", encoding = "UTF-8", warn = FALSE)
+
+rm_data$Reviews <- stri_remove_empty_na(rm_data$Reviews) #na.omit(rm_data$Reviews)
+rm_data$Gender <- stri_remove_empty_na(rm_data$Gender) #na.omit(rm_data$Gender)
+
+```
+
+# Filter the data for low rated obgyn
+
+```{r filter_data}
+# Create a new column with average of P, H, K column scores
+rm_data$avg_rating <- rowMeans(rm_data[,c('Helpfulness', 'Knowledge')], na.rm=TRUE)
+
+# Create a subset for obgyn doctors
+
+ob <- select(filter(rm_data, rm_data$Specialty == 'gynecologist-obgyn'), c('Doc_id', 'Doc_Name', 'Specialty','Gender', 'Helpfulness', 'Knowledge', 'Reviews', 'avg_rating'))
+
+low_rating_ob <- ob[ob$avg_rating < 3, ]
+
+```
+
+# Build LDA model
+
+```{r LDA_low}
+
+# Topic model for low-rated primary care doctors
+ob_corpus_low_reviews <- corpus(low_rating_ob$Reviews)
+
+# Document frequency matrix
+dfmt_ob_low <- suppressWarnings(dfm(ob_corpus_low_reviews, remove = stopwordsPL,remove_number = TRUE, remove_punct=TRUE) %>%
+  dfm_remove(stopwords('english'), min_nchar = 2) %>%
+  dfm_trim(min_termfreq = 0.5, termfreq_type = "quantile",
+           max_docfreq = 0.1, docfreq_type = "prop"))
+print(dfmt_ob_low)
+topfeatures(dfmt_ob_low, 10)
+
+# Initialize number of topics
+k_ob <- 5
+tmod_lda_ob <- LDA(dfmt_ob_low, k_ob, method="Gibbs", control=list(iter = 500, seed = 1, verbose = 25))
+
+# Get top 10 topics:
+topic_terms_ob<- terms(tmod_lda_ob, 20)
+print('Top 20 words per topic for low-rated PCP: \n')
+print(topic_terms_ob)
+
+# Get the posterior probabilities
+tmResult_ob <- posterior(tmod_lda_ob)
+tidy_topics_ob_low <- tmResult_ob$topics
+
+```
+
+```{r dfr, echo=FALSE}
+#r chunk
+library(reticulate)
+library(Rcpp)
+df_lowOB <- as.data.frame(cbind(low_rating_ob, tidy_topics_ob_low))
+names(df_lowOB)[names(df_lowOB) == '1'] <- 'Topic1'
+names(df_lowOB)[names(df_lowOB) == '2'] <- 'Topic2'
+names(df_lowOB)[names(df_lowOB) == '3'] <- 'Topic3'
+names(df_lowOB)[names(df_lowOB) == '4'] <- 'Topic4'
+names(df_lowOB)[names(df_lowOB) == '5'] <- 'Topic5'
+
+summary(df_lowOB)
+
+```
+
+# Coefficient Estimates for low-rated OBGYN
+
+```{r}
+df_lowOB$Gender = as.factor(df_lowOB$Gender)
+logreg_coeff = glm(Gender~Topic1+Topic2+Topic3+Topic4+Topic5, data = df_lowOB, family = 'binomial')
+summary(logreg_coeff)
+```
+
+# Split data into training and testing set for low-rated doctors
+
+```{python data_split}
+from sklearn.model_selection import train_test_split
+# Extract the topic probabilities from the main dataframe for independent variables
+
+X = r.df_lowOB.iloc[:,8:13]
+
+y = list(r.df_lowOB["Gender"])
+
+df_lowOB = r.df_lowOB
+ 
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state = 30, stratify = y)
+```
+
+# Logistic Regression for Low-rated OBGYN
+
+```{python classifiers}
+
+#build a log model
+from sklearn.linear_model import LogisticRegression
+logreg_ob = LogisticRegression(solver='lbfgs', multi_class='auto', max_iter=10000)
+
+#fit the data to the log model
+logreg_ob = logreg_ob.fit(X_train, y_train)
+
+```
+
+```{python metrics}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import pandas as pd
+import warnings
+warnings.filterwarnings("ignore")
+
+#predict new data
+y_pred_LR_ob = logreg_ob.predict(X_test)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_LR_ob, y_test))
+print('Confusion Matrix for LogReg for Low-Rated OBGYN:\n', classification_report(y_test, y_pred_LR_ob))
+```
+
+```{python rf_classifier}
+from sklearn.ensemble import RandomForestClassifier
+
+rand_clf = RandomForestClassifier(max_depth=2, random_state=0, n_estimators = 100)
+rand_clf = rand_clf.fit(X_train, y_train)
+
+```
+
+```{python rf_accuracy}
+#predict new data
+y_pred_rf = rand_clf.predict(X_test)
+
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_rf, y_test))
+print('Confusion Matrix for Random Forest for Low-Rated PCP:\n',classification_report(y_test, y_pred_rf))
+
+```
+
+
+```{python svm_classifier}
+from sklearn.svm import SVC
+
+svm_clf = SVC(gamma = 'auto')
+svm_clf = svm_clf.fit(X_train, y_train)
+```
+
+
+```{python svm_accuracy}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+
+#predict new data
+y_pred_svm = svm_clf.predict(X_test)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_svm, y_test))
+print('Confusion Matrix for SVM for Low-Rated PCP:\n',classification_report(y_test, y_pred_svm))
+```
+
+```{python xgb_classifier}
+from sklearn.ensemble import GradientBoostingClassifier
+xgb_clf = GradientBoostingClassifier(n_estimators=100, learning_rate=1.0,max_depth=1, random_state=0)
+
+#print("Mean Accuracy", xgb_clf.score(X_test, y_test))
+xgb_clf = xgb_clf.fit(X_train, y_train)
+
+```
+
+# Gradient Boosting Classifier for low-rated OBGYN
+
+```{python xgb_accuracy}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+
+#predict new data
+y_pred_xgb = xgb_clf.predict(X_test)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_xgb, y_test))
+print('Confusion Matrix for XGB for Low-Rated PCP:\n',classification_report(y_test, y_pred_xgb))
+```
+
+# Analyze the high rated OBGYN doctors Average Rating > 3
+
+```{r LDA_high}
+
+# Topic model for high-rated obgyn doctors
+library(ggplot2)
+library(tidytext)
+library(dplyr)
+library(arulesViz)
+
+high_rating_ob <- ob[ob$avg_rating > 3, ]
+
+ob_corpus_high_reviews <- Corpus(VectorSource(high_rating_ob$Reviews))#corpus(high_rating_pcp$Reviews)
+
+# Document frequency matrix
+
+# Remove high frequency words
+removeCommonTerms <- function (x, pct) 
+{
+    stopifnot(inherits(x, c("DocumentTermMatrix", "TermDocumentMatrix")), 
+        is.numeric(pct), pct > 0, pct < 1)
+    m <- if (inherits(x, "DocumentTermMatrix")) 
+        t(x)
+    else x
+    t <- table(m$i) < m$ncol * (pct)
+    termIndex <- as.numeric(names(t[t]))
+    if (inherits(x, "DocumentTermMatrix")) 
+        x[, termIndex]
+    else x[termIndex, ]
+}
+
+dfmt_ob_high = 
+  DocumentTermMatrix(ob_corpus_high_reviews,
+           control = list(stemming = TRUE, #create root words
+                          stopwords = TRUE, #remove stop words
+                          minWordLength = 3, #cut out small words
+                          removeNumbers = TRUE, #take out the numbers
+                          removePunctuation = TRUE)) #take out punctuation 
+removeCommonTerms(dfmt_ob_high, .8)
+
+#weight the space
+import_weight = tapply(dfmt_ob_high$v/row_sums(dfmt_ob_high)[dfmt_ob_high$i], 
+                       dfmt_ob_high$j, 
+                       mean) *
+  log2(nDocs(dfmt_ob_high)/col_sums(dfmt_ob_high > 0))
+
+#ignore very frequent and 0 terms
+
+dfmt_ob_high = dfmt_ob_high[ row_sums(dfmt_ob_high) > 0, ]
+set.seed(5678)
+
+# Initialize number of topics %>% 
+k <- 5
+tmod_lda_high <- LDA(dfmt_ob_high, k, method="Gibbs", control=list(iter = 500, seed = 1, verbose = 25))
+
+# Get top 10 topics:
+topic_terms_ob_high<- terms(tmod_lda_high, 20)
+print('Top 20 words per topic for high-rated PCP: \n')
+print(topic_terms_ob_high)
+
+# Get the posterior probabilities
+tmResult_high <- posterior(tmod_lda_high)
+tidy_topics_ob_high <- tmResult_high$topics
+
+```
+
+
+```{r dfr_high, echo=FALSE}
+library(reticulate)
+library(Rcpp)
+
+df_highOB <- as.data.frame(cbind(high_rating_ob, tidy_topics_ob_high))
+names(df_highOB)[names(df_highOB) == '1'] <- 'Topic1'
+names(df_highOB)[names(df_highOB) == '2'] <- 'Topic2'
+names(df_highOB)[names(df_highOB) == '3'] <- 'Topic3'
+names(df_highOB)[names(df_highOB) == '4'] <- 'Topic4'
+names(df_highOB)[names(df_highOB) == '5'] <- 'Topic5'
+summary(df_highOB)
+
+```
+
+# Coefficient Estimates for high-rated OBGYN 
+
+```{r}
+df_highOB$Gender = as.factor(df_highOB$Gender)
+logreg_coeff_h = glm(Gender~Topic1+Topic2+Topic3+Topic4+Topic5, data = df_highOB, family = 'binomial')
+summary(logreg_coeff_h)
+
+```
+
+
+```{python data_split_h}
+
+X_high = r.df_highOB.iloc[:,8:13]
+
+y_high = list(r.df_highOB["Gender"])
+
+df_highOB = r.df_highOB
+ 
+X_train_high, X_test_high, y_train_high, y_test_high = train_test_split(X_high, y_high, test_size=0.20, random_state = 31, stratify = y_high)
+```
+
+# Logistic Regression for Low-rated PCP
+
+```{python classifiers_high}
+
+#build a log model
+
+logreg_high = LogisticRegression(solver='lbfgs', multi_class='auto', max_iter=1000)
+
+#fit the data to the log model
+logreg_high = logreg_high.fit(X_train_high, y_train_high)
+
+```
+
+```{python metrics_high}
+
+#predict new data
+y_pred_LR_high = logreg_high.predict(X_test_high)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_LR_high, y_test_high))
+print('Confusion Matrix for LogReg for High-Rated OBGYN:\n', classification_report(y_test_high, y_pred_LR_high))
+```
+
+```{python rf_classifier_high}
+from sklearn.ensemble import RandomForestClassifier
+
+rand_clf_high = RandomForestClassifier(max_depth=2, random_state=0, n_estimators = 100)
+rand_clf_high = rand_clf_high.fit(X_train_high, y_train_high)
+
+```
+
+```{python rf_accuracy_high}
+#predict new data
+y_pred_rf_high = rand_clf_high.predict(X_test_high)
+
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_rf_high, y_test_high))
+print('Confusion Matrix for Random Forest for High-Rated OBGYN:\n',classification_report(y_test_high, y_pred_rf_high))
+
+```
+
+```{python svm_classifiers_high}
+from sklearn.svm import SVC
+
+svm_high = SVC(gamma = 'auto')
+svm_high = svm_high.fit(X_train_high, y_train_high)
+```
+
+```{python svm_accuracy_high}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+#predict new data
+y_pred_svm_high = svm_high.predict(X_test_high)
+
+#print out results
+print('accuracy %s' % accuracy_score(y_pred_svm_high, y_test_high))
+print('Confusion Matrix for LogReg for High-rated OBGYN:\n', classification_report(y_test_high, y_pred_svm_high))
+```
+
+# XGBclassifier for high-rated PCP
+
+```{python xgb_classifiers}
+from sklearn.ensemble import GradientBoostingClassifier
+xgb_high_clf = GradientBoostingClassifier(n_estimators=100, learning_rate=1.0,max_depth=1, random_state=0)
+
+xgb_high_clf = xgb_high_clf.fit(X_train_high, y_train_high)
+
+```
+
+```{python xgb_accuracy_high}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+#predict new data
+y_pred_xgb_high = xgb_high_clf.predict(X_test_high)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_xgb_high, y_test_high))
+print('Confusion Matrix for LogReg for High-rated OBGYN:\n', classification_report(y_test_high, y_pred_xgb_high))
+```

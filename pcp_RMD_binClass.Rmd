@@ -1,0 +1,487 @@
+---
+title: "pcp_RMD_binClass"
+author: "Sonam Gupta"
+date: "9/3/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Analysis on low-rated PCP doctors from RateMyDoctors dataset
+
+```{r preprocess_data}
+library(quanteda)
+library(seededlda)
+library(readr)
+library(BBmisc)
+library(dplyr)
+library(cld3)
+
+# Read the data in
+rm_data <- read.csv("D:/Education/HbgUniv/PhD DS/Sex_bias_thesis/SexBias/Online_reviews/Multi-Aspect-Sentiment-Classification-for-Online-Medical-Reviews-main/RateMDs/Binary_classification_tm/all_Github.csv", stringsAsFactors = FALSE, encoding = 'Windows-1252')
+
+# Rename column names
+colnames(rm_data) <- c("Doc_id", "Doc_Name", "Specialty", "Gender", "Staff", "Punctuality", "Helpfulness", "Knowledge", "Reviews")
+
+# Convert the Review column to text column from char type
+rm_data$Reviews <- as.character(rm_data$Reviews)
+
+# Remove rows based on duplicated reviews
+rm_data_nodups <- subset(rm_data, !duplicated(subset(rm_data, select=c(Reviews))))
+
+# Remove non-English reviews from the main non-duplicated dataframe
+rm_data_nodups <- rm_data_nodups[!(detect_language(rm_data_nodups$Reviews) != 'en'), ]
+
+# Excluding empty strings
+rm_data_nodups <- rm_data_nodups[complete.cases(rm_data_nodups),]
+  
+summary(rm_data_nodups)
+
+# Convert unduplicated dataframe to csv file
+# write.csv(rm_data_nodups, "D:/Education/HbgUniv/PhD DS/Sex_bias_thesis/SexBias/Online_reviews/Multi-Aspect-Sentiment-Classification-for-Online-Medical-Reviews-main/RateMDs/Binary_classification_tm/rateMD_noDups.csv")
+
+```
+
+
+# Dictionary of seed words and assign a topic label
+
+```{r seed_words}
+seedwords_dict <- dictionary(list(appearance = c('attractive','young', 'beautiful','pretty','handsome', 'figure', 'smile', 'smiles', 'aged', 'gorgeous', 'outfit', 'moods'),
+                                  warmth = c('comfortable', 'considerate','interpersonal','nice', 'friendly', 'safe', 'ease', 'approachable', 'sweet', 'pleasant','helpful', 'welcoming', 'accommodating', 'welcomed', 'empathetic', 'compassionate', 'friendly', 'polite', 'lovely', 'courteous', 'cheerful'),
+                                  gendered = c('lady','woman', 'man', 'guy', 'male', 'female', 'she','he', 'her', 'him','gal', 'gentleman', 'fellow'),
+                                  competence = c('superior', 'impressive','competent','arrogant','ambitious','skilled', 'skillful', 'skills', 'exemplary', 'excellence', 'superb', 'stellar', 'capable', 'talented', 'impeccable', 'meticulous', 'proficient', 'condescending', 'abrupt', 'cold', 'rude', 'dismissive', 'impatient', 'unprofessional')))
+
+# Customized stopwords list used when building document term frequency matrix
+stopwordsPL <- readLines("D:/Education/HbgUniv/PhD DS/Sex_bias_thesis/SexBias/Online_reviews/Multi-Aspect-Sentiment-Classification-for-Online-Medical-Reviews-main/RateMDs/stopwords.txt", encoding = "UTF-8", warn = FALSE)
+```
+
+# Filter the data for low rated PCP
+
+```{r filter_data}
+# Create a new column with average of P, H, K column scores
+rm_data_nodups$avg_rating <- rowMeans(rm_data_nodups[,c('Helpfulness', 'Knowledge')], na.rm=TRUE)
+
+# Create a subset for primary care doctors
+specialty <- c('family-gp', 'nurse-practitioner')
+pcp <- select(filter(rm_data_nodups, rm_data_nodups$Specialty == 'family-gp'| rm_data_nodups$Specialty == 'nurse-practitioner'), c('Doc_id', 'Doc_Name', 'Specialty','Gender', 'Helpfulness', 'Knowledge', 'Reviews', 'avg_rating'))
+
+low_rating_pcp <- pcp[pcp$avg_rating < 3, ]
+```
+
+# Topic model for low-rated PCP
+
+```{r topic_model_low}
+# Build a document feature matrix with basic pre-processing on data
+# For defining the frequency thresholds, trim the dfm using min and max frequency for terms for every topic and topic for every document
+# termfreq_type basically tells us how to interpret the min and max term frequency similar to docfreq_type
+# docfreq_type = prop is dividing the document frequencies by the total sum
+
+# Topic model for low-rated primary care doctors
+pcp_corpus_low_reviews <- corpus(low_rating_pcp$Reviews)
+
+# Document frequency matrix
+dfmt_pcp_low <- suppressWarnings(dfm(pcp_corpus_low_reviews, remove = stopwordsPL,remove_number = TRUE, remove_punct=TRUE) %>%
+  dfm_remove(stopwords('english'), min_nchar = 2) %>%
+  dfm_trim(min_termfreq = 0.5, termfreq_type = "quantile",
+           max_docfreq = 0.1, docfreq_type = "prop"))
+print(dfmt_pcp_low)
+topfeatures(dfmt_pcp_low, 10)
+
+set.seed(5678) 
+
+# Call the seededlda function and pass the document feature matrix as well as the dictionary of seeded words
+# residual = TRUE means output the junk words that are grouped together as the 'other' topic 
+slda_pcp <- textmodel_seededlda(dfmt_pcp_low, seedwords_dict, beta = 0.5, residual = TRUE)
+
+# get theta values for terms per topic
+tidy_topics_pcp_low <- as_tibble(slda_pcp$theta, rownames = "Review")
+
+# Print top 20 terms per topic
+topic_terms_pcp <- terms(slda_pcp, 40)
+print('Top 20 words per topic for low-rated PCP: \n')
+print(topic_terms_pcp)
+
+# Calculate the count of words per topic
+topic_pcp_low <- table(topics(slda_pcp))
+
+```
+
+# Build binary classification model using topic models
+
+```{r dataframe, echo=FALSE}
+library(reticulate)
+library(Rcpp)
+df_lowPCP <- as.data.frame(cbind(low_rating_pcp, tidy_topics_pcp_low))
+summary(df_lowPCP)
+```
+# Coefficients from Logistic Regression for Low-Rated PCP
+
+```{r}
+df_lowPCP$Gender = as.factor(df_lowPCP$Gender)
+logreg_coeff = glm(Gender~appearance+warmth+gendered+competence+other, data = df_lowPCP, family = 'binomial')
+summary(logreg_coeff)
+```
+
+
+```{r libraries, echo=FALSE}
+library(reticulate)
+#library(testthat)
+#py_install("pyLDAvis")
+#py_install("gensim")
+#py_install("nltk")
+#py_install("matplotlib")
+# py_install("scikit-learn")
+# py_install("python-Levenshtein")
+```
+
+
+# Split data into training and testing set for low-rated doctors
+
+```{python data_split}
+from sklearn.model_selection import train_test_split
+# Extract the topic probabilities from the main dataframe for independent variables
+
+X = r.df_lowPCP.iloc[:,9:13]
+
+y = list(r.df_lowPCP["Gender"])
+
+df_lowPCP = r.df_lowPCP
+ 
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state = 41, stratify = y)
+```
+
+# Logistic Regression for Low-rated PCP
+
+```{python classifiers}
+
+#build a log model
+from sklearn.linear_model import LogisticRegression
+logreg = LogisticRegression(solver='lbfgs', multi_class='auto', max_iter=1000)
+
+#fit the data to the log model
+logreg = logreg.fit(X_train, y_train)
+
+```
+
+```{python metrics}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import pandas as pd
+import warnings
+warnings.filterwarnings("ignore")
+
+#predict new data
+y_pred_LR = logreg.predict(X_test)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_LR, y_test))
+print('Confusion Matrix for LogReg for Low-Rated PCP:\n', classification_report(y_test, y_pred_LR))
+```
+
+# Random Forest Classifier for Low-rated PCP
+
+```{python data_rf}
+# from sklearn.model_selection import train_test_split
+# # Extract the topic probabilities from the main dataframe for independent variables
+# 
+# X = r.df_lowPCP.iloc[:,9:13]
+# 
+# y = list(r.df_lowPCP["Gender"])
+# 
+# df_lowPCP = r.df_lowPCP
+#  
+# X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state = 42, stratify = y)
+```
+
+```{python rf_classifier}
+from sklearn.ensemble import RandomForestClassifier
+
+rand_clf = RandomForestClassifier(max_depth=2, random_state=0, n_estimators = 100)
+rand_clf = rand_clf.fit(X_train, y_train)
+
+```
+
+```{python rf_accuracy}
+#predict new data
+y_pred_rf = rand_clf.predict(X_test)
+
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_rf, y_test))
+print('Confusion Matrix for Random Forest for Low-Rated PCP:\n',classification_report(y_test, y_pred_rf))
+
+```
+
+# SVM Classifier for low-rated PCP
+
+```{python data_svm}
+# from sklearn.model_selection import train_test_split
+# # Extract the topic probabilities from the main dataframe for independent variables
+# 
+# X = r.df_lowPCP.iloc[:,9:13]
+# 
+# y = list(r.df_lowPCP["Gender"])
+# 
+# df_lowPCP = r.df_lowPCP
+#  
+# X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state = 50, stratify = y)
+```
+
+```{python svm_classifier}
+from sklearn.svm import SVC
+
+svm_clf = SVC(gamma = 'auto')
+svm_clf = svm_clf.fit(X_train, y_train)
+```
+
+
+```{python svm_accuracy}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+
+#predict new data
+y_pred_svm = svm_clf.predict(X_test)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_svm, y_test))
+print('Confusion Matrix for SVM for Low-Rated PCP:\n',classification_report(y_test, y_pred_svm))
+```
+
+```{python data_xgb}
+# from sklearn.model_selection import train_test_split
+# # Extract the topic probabilities from the main dataframe for independent variables
+# 
+# X = r.df_lowPCP.iloc[:,9:13]
+# 
+# y = list(r.df_lowPCP["Gender"])
+# 
+# df_lowPCP = r.df_lowPCP
+#  
+# X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state = 52, stratify = y)
+
+```
+
+```{python xgb_classifier}
+from sklearn.ensemble import GradientBoostingClassifier
+xgb_clf = GradientBoostingClassifier(n_estimators=100, learning_rate=1.0,max_depth=1, random_state=0)
+
+#print("Mean Accuracy", xgb_clf.score(X_test, y_test))
+xgb_clf = xgb_clf.fit(X_train, y_train)
+```
+# Gradient Boosting Classifier for low-rated PCP
+
+```{python xgb_accuracy}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+
+#predict new data
+y_pred_xgb = xgb_clf.predict(X_test)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_xgb, y_test))
+print('Confusion Matrix for XGB for Low-Rated PCP:\n',classification_report(y_test, y_pred_xgb))
+```
+
+# Analyze the high rated PCP doctors Average Rating > 3
+
+```{r topic_model_high, echo=FALSE}
+
+high_rating_pcp <- pcp[pcp$avg_rating > 3, ]
+
+# Topic model for low-rated primary care doctors
+pcp_corpus_high_reviews <- corpus(high_rating_pcp$Reviews)
+
+# Document frequency matrix
+dfmt_pcp_high <- suppressWarnings(dfm(pcp_corpus_high_reviews, remove = stopwordsPL,remove_number = TRUE, remove_punct=TRUE) %>%
+  dfm_remove(stopwords('english'), min_nchar = 2) %>%
+  dfm_trim(min_termfreq = 0.5, termfreq_type = "quantile",
+           max_docfreq = 0.1, docfreq_type = "prop"))
+print(dfmt_pcp_high)
+topfeatures(dfmt_pcp_high, 10)
+
+set.seed(5678) 
+
+slda_pcp_high <- textmodel_seededlda(dfmt_pcp_high, seedwords_dict, beta = 0.5, residual = TRUE)
+
+# get theta values for terms per topic
+tidy_topics_pcp_high <- as_tibble(slda_pcp_high$theta, rownames = "Review")
+
+# Print top 20 terms per topic
+topic_terms_pcp_high <- terms(slda_pcp_high, 40)
+
+print(topic_terms_pcp_high)
+
+# Calculate the count of words per topic
+topic_pcp_high <- table(topics(slda_pcp_high))
+
+```
+
+# Build binary classification model using topic models
+
+```{r df_high, echo=FALSE}
+library(reticulate)
+library(Rcpp)
+df_highPCP <- as.data.frame(cbind(high_rating_pcp, tidy_topics_pcp_high))
+summary(df_highPCP)
+
+```
+
+```{r}
+df_highPCP$Gender = as.factor(df_highPCP$Gender)
+logreg_coeff_h = glm(Gender~appearance+warmth+gendered+competence+other, data = df_highPCP, family = 'binomial')
+summary(logreg_coeff_h)
+```
+
+# Split train and test data for high rated PCPs
+
+```{python data_split_high}
+from sklearn.model_selection import train_test_split
+# Extract the topic probabilities from the main dataframe for independent variables
+
+X_high = r.df_highPCP.iloc[:,9:13]
+
+y_high = list(r.df_highPCP["Gender"])
+
+df_highPCP = r.df_highPCP
+ 
+X_train_high, X_test_high, y_train_high, y_test_high = train_test_split(X_high, y_high, test_size=0.20, random_state = 47, stratify = y_high)
+```
+
+# Logistic Regression for High-rated PCP
+
+```{python classifier}
+
+#build a log model
+from sklearn.linear_model import LogisticRegression
+logreg_high = LogisticRegression(solver='lbfgs', multi_class='auto', max_iter=1000)
+
+#fit the data to the log model
+logreg_high = logreg_high.fit(X_train_high, y_train_high)
+
+```
+
+```{python lr_metrics}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import pandas as pd
+import warnings
+warnings.filterwarnings("ignore")
+#predict new data
+y_pred_high = logreg_high.predict(X_test_high)
+
+#print out results
+print('accuracy %s' % accuracy_score(y_pred_high, y_test_high))
+print('Confusion Matrix for LogReg for High-rated PCP:\n',classification_report(y_test_high, y_pred_high))
+```
+
+# Random Forest classifier
+
+```{python data_rf_split_h}
+# X_high = r.df_highPCP.iloc[:,9:13]
+# 
+# X_high = list(r.df_highPCP["Gender"])
+# 
+# df_highPCP = r.df_highPCP
+#  
+# X_train_high, X_test_high, y_train_high, y_test_high = train_test_split(X_high, y_high, test_size=0.20, random_state = 42, stratify = y_high)
+```
+
+```{python rf_classifiers}
+from sklearn.ensemble import RandomForestClassifier
+
+rand_clf_high = RandomForestClassifier(max_depth=2, random_state=0, n_estimators = 100)
+rand_clf_high =rand_clf_high.fit(X_train_high, y_train_high)
+
+```
+
+```{python rf_high_metrics}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import cross_val_score
+import pandas as pd
+
+#predict new data
+y_pred_rf_high = rand_clf_high.predict(X_test_high)
+
+#print out results
+print('accuracy %s' % accuracy_score(y_pred_rf_high, y_test_high))
+print('Confusion Matrix for Random Forest for High-rated PCP:\n',classification_report(y_test_high, y_pred_rf_high))
+
+```
+
+# SVM Classifier
+
+```{python data_svm_h}
+# X_high = r.df_highPCP.iloc[:,9:13]
+# 
+# X_high = list(r.df_highPCP["Gender"])
+# 
+# df_highPCP = r.df_highPCP
+#  
+# X_train_high, X_test_high, y_train_high, y_test_high = train_test_split(X_high, y_high, test_size=0.20, random_state = 50, stratify = y_high)
+```
+
+```{python svm_classifiers}
+from sklearn.svm import SVC
+
+svm_high = SVC(gamma = 'auto')
+svm_high = svm_high.fit(X_train_high, y_train_high)
+```
+
+
+```{python svm_accuracy_high}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+#predict new data
+y_pred_svm_high = svm_high.predict(X_test_high)
+
+#print out results
+print('accuracy %s' % accuracy_score(y_pred_svm_high, y_test_high))
+print('Confusion Matrix for SVM for High-rated PCP:\n', classification_report(y_test_high, y_pred_svm_high))
+```
+
+```{python data_xgb_h}
+
+# X_high = r.df_highPCP.iloc[:,9:13]
+# 
+# X_high = list(r.df_highPCP["Gender"])
+# 
+# df_highPCP = r.df_highPCP
+#  
+# X_train_high, X_test_high, y_train_high, y_test_high = train_test_split(X_high, y_high, test_size=0.20, random_state = 52, stratify = y_high)
+
+```
+
+# XGBclassifier for high-rated PCP
+
+```{python xgb_classifiers}
+from sklearn.ensemble import GradientBoostingClassifier
+xgb_high_clf = GradientBoostingClassifier(n_estimators=100, learning_rate=1.0,max_depth=1, random_state=0)
+
+xgb_high_clf = xgb_high_clf.fit(X_train_high, y_train_high)
+
+```
+
+```{python xgb_accuracy_high}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+#predict new data
+y_pred_xgb_high = xgb_high_clf.predict(X_test_high)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_xgb_high, y_test_high))
+print('Confusion Matrix for LogReg for High-rated PCP:\n', classification_report(y_test_high, y_pred_xgb_high))
+```

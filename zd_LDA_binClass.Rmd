@@ -1,0 +1,395 @@
+---
+title: "zd_LDA_binClass"
+author: "Sonam Gupta"
+date: "11/3/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r data}
+library(quanteda)
+library(readr)
+library(BBmisc)
+library(stringi)
+library(tm)
+library(topicmodels)
+library(slam)
+library(dplyr)
+library(cld3)
+
+# Read the dataset downloaded from GitHub Repo as referenced in the main paper
+zdata <- read.csv("D:/Education/HbgUniv/PhD DS/Sex_bias_thesis/SexBias/Online_reviews/MLReviewsToRatings/DATA/SeededLDA_LDA_binClass/zocdoc_data.csv")
+
+# Rename column names
+colnames(zdata) <- c("Doc_id", "Gender", "Reviews", "OverallRating", "BedsideMannerRating", "WaitTimeRating")
+
+# stri_remove_empty_na(zdata$Reviews)
+# stri_remove_empty_na(zdata$Gender)
+
+zdata$Reviews <- na.omit(zdata$Reviews)
+zdata$Gender <-na.omit(zdata$Gender)
+
+# Remove duplicates
+zdata_nodups <- subset(zdata, !duplicated(subset(zdata, select=c(Reviews))))
+
+# Remove non-English reviews from the main non-duplicated dataframe
+zdata_nodups <- zdata_nodups[!(detect_language(zdata_nodups$Reviews) != 'en'), ]
+
+# Excluding empty strings
+zdata_nodups <- zdata_nodups[complete.cases(zdata_nodups),]
+
+# Create a new column with average of BedsideManner and WaitTime column scores
+zdata_nodups$avg_rating <- rowMeans(zdata_nodups[,c('BedsideMannerRating', 'WaitTimeRating')], na.rm=TRUE)
+
+```
+
+
+```{r stopwords, echo= FALSE}
+
+stopwordsPL <- readLines("D:/Education/HbgUniv/PhD DS/Sex_bias_thesis/SexBias/Online_reviews/Multi-Aspect-Sentiment-Classification-for-Online-Medical-Reviews-main/RateMDs/stopwords.txt", encoding = "UTF-8", warn = FALSE)
+
+```
+
+
+## Low-rated doctors
+
+```{r lda_low_rated}
+# Filter low rated doctors
+low_rated <- zdata_nodups[zdata_nodups$avg_rating < 3, ]
+
+corpus_reviews <- Corpus(VectorSource(low_rated$Reviews))
+
+# Document frequency matrix
+
+# Remove high frequency words
+removeCommonTerms <- function (x, pct)
+{
+    stopifnot(inherits(x, c("DocumentTermMatrix", "TermDocumentMatrix")),
+        is.numeric(pct), pct > 0, pct < 1)
+    m <- if (inherits(x, "DocumentTermMatrix"))
+        t(x)
+    else x
+    t <- table(m$i) < m$ncol * (pct)
+    termIndex <- as.numeric(names(t[t]))
+    if (inherits(x, "DocumentTermMatrix"))
+        x[, termIndex]
+    else x[termIndex, ]
+}
+
+dfmt_all =
+  DocumentTermMatrix(corpus_reviews,
+           control = list(stemming = TRUE, #create root words
+                          stopwords = TRUE, #remove stop words
+                          minWordLength = 3, #cut out small words
+                          removeNumbers = TRUE, #take out the numbers
+                          removePunctuation = TRUE)) #take out punctuation
+removeCommonTerms(dfmt_all, .8)
+
+#weight the space
+import_weight = tapply(dfmt_all$v/row_sums(dfmt_all)[dfmt_all$i],
+                       dfmt_all$j,
+                       mean) *
+  log2(nDocs(dfmt_all)/col_sums(dfmt_all > 0))
+
+#ignore very frequent and 0 terms
+
+dfmt_all = dfmt_all[ row_sums(dfmt_all) > 0, ]
+set.seed(5678)
+
+# Initialize number of topics
+k <- 5
+tmod_lda <- LDA(dfmt_all, k, method="Gibbs", control=list(iter = 500, seed = 1, verbose = 25))
+
+#LDA(dfmt_all, k, control = list(alpha = 0.1))
+# Get top 10 topics:
+topic_terms<- terms(tmod_lda, 20)
+print('Top 20 words per topic for low-rated reviews: \n')
+print(topic_terms)
+
+# Get the posterior probabilities
+tmResult <- posterior(tmod_lda)
+tidy_topics <- tmResult$topics
+# tidy_topics <- as.data.frame(tmod_lda@gamma)
+
+```
+
+```{r dataframe, echo=FALSE}
+library(reticulate)
+library(Rcpp)
+
+df_low <- merge(data.frame(low_rated, row.names=NULL), data.frame(tidy_topics, row.names=NULL), 
+  by = 0, all = TRUE)[-1] #as.data.frame(cbind(zdata_nodups, tidy_topics))
+df_low$Gender <- na.omit(df_low$Gender)
+summary(df_low)
+
+```
+
+# Split data into training and testing set for low-rated doctors
+
+```{python data_split}
+from sklearn.model_selection import train_test_split
+# Extract the topic probabilities from the main dataframe for independent variables
+
+X_low = r.df_low.iloc[:,8:13]
+
+y_low = list(r.df_low["Gender"])
+
+df_low = r.df_low
+ 
+X_train_low, X_test_low, y_train_low, y_test_low = train_test_split(X_low, y_low, test_size=0.20, random_state = 41, stratify = y_low)
+```
+# Logistic regression for low-rated doctors
+
+```{python classifiers}
+
+#build a log model
+from sklearn.linear_model import LogisticRegression
+logreg_low = LogisticRegression(solver='lbfgs', multi_class='auto', max_iter=1000)
+
+#fit the data to the log model
+logreg_low = logreg_low.fit(X_train_low, y_train_low)
+
+```
+
+```{python metrics}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import pandas as pd
+import warnings
+warnings.filterwarnings("ignore")
+
+#predict new data
+y_pred_LR = logreg_low.predict(X_test_low)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_LR, y_test_low))
+print('Confusion Matrix for LogReg for Low-Rated Doctors:\n', classification_report(y_test_low, y_pred_LR))
+```
+
+# Random Forest Classifier for Low-rated Doctors
+
+```{python rf_classifier}
+from sklearn.ensemble import RandomForestClassifier
+
+rand_clf = RandomForestClassifier(max_depth = 2, random_state=0, n_estimators = 100)
+rand_clf = rand_clf.fit(X_train_low, y_train_low)
+
+```
+
+```{python rf_metrics_low}
+#predict new data
+y_pred_rf = rand_clf.predict(X_test_low)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_rf, y_test_low))
+print('Confusion Matrix for Random Forest for Low-Rated Doctors:\n',classification_report(y_test_low, y_pred_rf))
+
+```
+
+# SVM Classifier for low-rated doctors
+
+```{python svm_classifier}
+from sklearn.svm import SVC
+
+svm_clf = SVC(gamma = 'auto')
+svm_clf = svm_clf.fit(X_train_low, y_train_low)
+```
+```{python svm_clf}
+#predict new data
+y_pred_svm = svm_clf.predict(X_test_low)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_svm, y_test_low))
+print('Confusion Matrix for SVM for Low-Rated PCP:\n',classification_report(y_test_low, y_pred_svm))
+```
+
+```{python xgb_classifier}
+from sklearn.ensemble import GradientBoostingClassifier
+xgb_clf = GradientBoostingClassifier(n_estimators=100, learning_rate=1.0,max_depth=1, random_state=0)
+
+xgb_clf = xgb_clf.fit(X_train_low, y_train_low)
+```
+
+# Gradient Boosting Classifier for low-rated Doctors
+
+```{python xgb_accuracy}
+
+#predict new data
+y_pred_xgb = xgb_clf.predict(X_test_low)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_xgb, y_test_low))
+print('Confusion Matrix for XGB for Low-Rated PCP:\n',classification_report(y_test_low, y_pred_xgb))
+```
+
+## Analysis of high-rated doctors
+
+```{r lda_high_rated}
+# Filter high rated doctors
+high_rated <- zdata_nodups[zdata_nodups$avg_rating > 3, ]
+
+corpus_reviews <- Corpus(VectorSource(high_rated$Reviews))
+
+# Document frequency matrix
+
+# Remove high frequency words
+removeCommonTerms <- function (x, pct)
+{
+    stopifnot(inherits(x, c("DocumentTermMatrix", "TermDocumentMatrix")),
+        is.numeric(pct), pct > 0, pct < 1)
+    m <- if (inherits(x, "DocumentTermMatrix"))
+        t(x)
+    else x
+    t <- table(m$i) < m$ncol * (pct)
+    termIndex <- as.numeric(names(t[t]))
+    if (inherits(x, "DocumentTermMatrix"))
+        x[, termIndex]
+    else x[termIndex, ]
+}
+
+dfmt_high =
+  DocumentTermMatrix(corpus_reviews,
+           control = list(stemming = TRUE, #create root words
+                          stopwords = TRUE, #remove stop words
+                          minWordLength = 3, #cut out small words
+                          removeNumbers = TRUE, #take out the numbers
+                          removePunctuation = TRUE)) #take out punctuation
+removeCommonTerms(dfmt_high, .8)
+
+#weight the space
+import_weight = tapply(dfmt_high$v/row_sums(dfmt_high)[dfmt_high$i],
+                       dfmt_high$j,
+                       mean) *
+  log2(nDocs(dfmt_high)/col_sums(dfmt_high > 0))
+
+#ignore very frequent and 0 terms
+
+dfmt_high = dfmt_high[ row_sums(dfmt_high) > 0, ]
+set.seed(5678)
+
+# Initialize number of topics
+k <- 5
+tmod_lda_high <- LDA(dfmt_high, k, method="Gibbs", control=list(iter = 500, seed = 1, verbose = 25))
+
+#LDA(dfmt_high, k, control = list(alpha = 0.1))
+# Get top 10 topics:
+topic_terms_high<- terms(tmod_lda_high, 20)
+print('Top 20 words per topic for high-rated reviews: \n')
+print(topic_terms_high)
+
+# Get the posterior probabilities
+tmResult_high <- posterior(tmod_lda_high)
+tidy_topics_high <- tmResult_high$topics
+# tidy_topic_highs <- as.data.frame(tmod_lda_high@gamma)
+
+```
+
+```{r dataframe_h, echo=FALSE}
+library(reticulate)
+library(Rcpp)
+
+df_high <- merge(data.frame(high_rated, row.names=NULL), data.frame(tidy_topics_high, row.names=NULL), 
+  by = 0, all = TRUE)[-1] #as.data.frame(cbind(zdata_nodups, tidy_topics))
+
+df_high <- na.omit(df_high)
+
+df_high$Gender <- na.omit(df_high$Gender)
+
+summary(df_high)
+```
+
+# Split data into training and testing set for high-rated doctors
+
+```{python data_split_high}
+X_high = r.df_high.iloc[:,8:13]
+
+y_high = list(r.df_high["Gender"])
+
+df_high = r.df_high
+ 
+X_train_high, X_test_high, y_train_high, y_test_high = train_test_split(X_high, y_high, test_size=0.20, random_state = 40, stratify = y_high)
+
+```
+
+# Logistic Regression for High-rated Doctors
+
+```{python classifier_h}
+
+#build a log model
+from sklearn.linear_model import LogisticRegression
+logreg_high = LogisticRegression(solver='lbfgs', multi_class='auto', max_iter=1000)
+
+#fit the data to the log model
+logreg_high = logreg_high.fit(X_train_high, y_train_high)
+
+```
+
+```{python metrics_high}
+
+#predict new data
+y_pred_LR_high = logreg_high.predict(X_test_high)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_LR_high, y_test_high))
+print('Confusion Matrix for LogReg for High-Rated Doctors:\n', classification_report(y_test_high, y_pred_LR_high))
+```
+
+# Random Forest Classifier for HIgh-rated Doctors
+
+```{python rf_classifiers_h}
+
+rand_clf_h = RandomForestClassifier(max_depth = 2, random_state=0, n_estimators = 100)
+rand_clf_h = rand_clf_h.fit(X_train_high, y_train_high)
+
+```
+
+```{python rf_metrics_high}
+#predict new data
+y_pred_rf_high = rand_clf_h.predict(X_test_high)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_rf_high, y_test_high))
+print('Confusion Matrix for Random Forest for High-Rated Doctors:\n',classification_report(y_test_high, y_pred_rf_high))
+
+```
+
+# SVM Classifier for high-rated doctors
+
+```{python svm_classifiers_h}
+
+svm_clf_high = SVC(gamma = 'auto')
+svm_clf_high = svm_clf_high.fit(X_train_high, y_train_high)
+```
+
+
+```{python svm_clf_metrics}
+#predict new data
+y_pred_svm_high = svm_clf_high.predict(X_test_high)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_svm_high, y_test_high))
+print('Confusion Matrix for SVM for High-Rated Doctors:\n',classification_report(y_test_high, y_pred_svm_high))
+```
+
+```{python xgb_classifier_high}
+
+xgb_clf_high = GradientBoostingClassifier(n_estimators=100, learning_rate=1.0,max_depth=1, random_state=0)
+
+xgb_clf_high = xgb_clf_high.fit(X_train_high, y_train_high)
+```
+
+# Gradient Boosting Classifier for high-rated Doctors
+
+```{python xgb_accuracy_high}
+
+#predict new data
+y_pred_xgb_high = xgb_clf_high.predict(X_test_high)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_xgb_high, y_test_high))
+print('Confusion Matrix for XGB for High-Rated Doctors:\n',classification_report(y_test_high, y_pred_xgb_high))
+```

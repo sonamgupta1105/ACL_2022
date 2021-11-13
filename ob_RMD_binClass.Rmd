@@ -1,0 +1,443 @@
+---
+title: "ob_RMD_binClass"
+author: "Sonam Gupta"
+date: "9/4/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Analysis of low-rated OBGYN doctors
+
+```{r read_data}
+library(quanteda)
+library(seededlda)
+library(readr)
+library(BBmisc)
+library(dplyr)
+
+library(cld3)
+# Read the data in
+rm_data_nodups <- read.csv("D:/Education/HbgUniv/PhD DS/Sex_bias_thesis/SexBias/Online_reviews/Multi-Aspect-Sentiment-Classification-for-Online-Medical-Reviews-main/RateMDs/Binary_classification_tm/rateMD_noDups.csv")
+
+# Create a new column with average of P, H, K column scores
+rm_data_nodups$avg_rating <- rowMeans(rm_data_nodups[,c('Helpfulness', 'Knowledge')], na.rm=TRUE)
+
+# Create a subset for obgyn doctors
+
+ob <- select(filter(rm_data_nodups, rm_data_nodups$Specialty == 'gynecologist-obgyn'), c('Doc_id', 'Doc_Name', 'Specialty','Gender', 'Helpfulness', 'Knowledge', 'Reviews', 'avg_rating'))
+
+low_rating_ob <- ob[ob$avg_rating < 3, ]
+
+```
+
+# Dictionary of seed words and assign a topic label
+
+```{r seed_words, echo=FALSE}
+seedwords_dict <- dictionary(list(appearance = c('attractive','young', 'beautiful','pretty','handsome', 'figure', 'smile', 'smiles', 'aged', 'gorgeous', 'outfit', 'moods'),
+                                  warmth = c('comfortable', 'considerate','interpersonal','nice', 'friendly', 'safe', 'ease', 'approachable', 'sweet', 'pleasant','helpful', 'welcoming', 'accomodating', 'welcomed', 'empathetic', 'compassionate', 'friendly', 'polite', 'lovely', 'courteous', 'cheerful'),
+                                  gendered = c('lady','woman', 'man', 'guy', 'male', 'female', 'she','he', 'her', 'him','gal', 'gentleman', 'fellow'),
+                                  competence = c('superior', 'impressive','competent','arrogant','ambitious','skilled', 'skillful', 'skills', 'exemplary', 'excellence', 'superb', 'stellar', 'capable', 'talented', 'impeccable', 'meticulous', 'proficient', 'condescending', 'abrupt', 'cold', 'rude', 'dismissive', 'impatient', 'unprofessional')))
+
+# Customized stopwords list used when building document term frequency matrix
+stopwordsPL <- readLines("D:/Education/HbgUniv/PhD DS/Sex_bias_thesis/SexBias/Online_reviews/Multi-Aspect-Sentiment-Classification-for-Online-Medical-Reviews-main/RateMDs/stopwords.txt", encoding = "UTF-8", warn = FALSE)
+```
+
+```{r topic_models_l, echo=FALSE}
+
+# Topic model for low-rated obgyn doctors
+ob_corpus_low_reviews <- corpus(low_rating_ob$Reviews)
+
+# Document frequency matrix
+dfmt_ob_low <- suppressWarnings(dfm(ob_corpus_low_reviews, remove = stopwordsPL,remove_number = TRUE, remove_punct=TRUE) %>%
+  dfm_remove(stopwords('english'), min_nchar = 2) %>%
+  dfm_trim(min_termfreq = 0.5, termfreq_type = "quantile",
+           max_docfreq = 0.1, docfreq_type = "prop"))
+print(dfmt_ob_low)
+topfeatures(dfmt_ob_low, 10)
+
+set.seed(5678) 
+
+# Call the seededlda function and pass the document feature matrix as well as the dictionary of seeded words
+# residual = TRUE means output the junk words that are grouped together as the 'other' topic 
+slda_ob <- textmodel_seededlda(dfmt_ob_low, seedwords_dict, beta = 0.5, residual = TRUE)
+
+# get theta values for terms per topic
+tidy_topics_ob_low <- as_tibble(slda_ob$theta, rownames = "Review")
+
+# Print top 20 terms per topic
+topic_terms_ob <- terms(slda_ob, 40)
+topic_terms_ob
+
+# Calculate the count of words per topic
+topic_ob_low <- table(topics(slda_ob))
+
+```
+
+```{r dframe_l, echo=FALSE}
+library(Rcpp)
+df_lowOB <- as.data.frame(cbind(low_rating_ob, tidy_topics_ob_low))
+summary(df_lowOB)
+```
+```{r}
+df_lowOB$Gender = as.factor(df_lowOB$Gender)
+logreg_coeff = glm(Gender~appearance+warmth+gendered+competence+other, data = df_lowOB, family = 'binomial')
+summary(logreg_coeff)
+levels(df_lowOB$Gender)
+```
+
+# Get texts and data from R
+
+```{python data_logreg_l}
+from sklearn.model_selection import train_test_split
+# Extract the topic probabilities from the main dataframe for independent variables
+
+X = r.df_lowOB.iloc[:,9:13]
+
+y = list(r.df_lowOB["Gender"])
+
+df_lowOB = r.df_lowOB
+ 
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state = 50, stratify = y)
+```
+
+```{python classifier_l}
+
+#build a log model
+from sklearn.linear_model import LogisticRegression
+logreg = LogisticRegression(solver='liblinear', multi_class='ovr', max_iter=1000)
+
+#fit the data to the log model
+logreg = logreg.fit(X_train, y_train)
+
+```
+
+```{python accuracy_l}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import pandas as pd
+import warnings
+warnings.filterwarnings("ignore")
+
+#predict new data
+y_pred = logreg.predict(X_test)
+# pred = pd.DataFrame(y_pred)
+# pred.describe
+X_test['predictions'] = y_pred
+#print out results
+print('Accuracy %s from Logistic regression' % accuracy_score(y_pred, y_test))
+print(classification_report(y_test, y_pred))
+```
+
+# Random Forest classifier
+
+```{python data_rf_l}
+# from sklearn.model_selection import train_test_split
+# Extract the topic probabilities from the main dataframe for independent variables
+
+X = r.df_lowOB.iloc[:,9:13]
+
+y = list(r.df_lowOB["Gender"])
+
+df_lowOB = r.df_lowOB
+ 
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state = 50, stratify = y)
+```
+
+```{python rf_classifier}
+from sklearn.ensemble import RandomForestClassifier
+
+clf = RandomForestClassifier(max_depth = 3, random_state=0, n_estimators = 172, criterion = 'gini')
+clf = clf.fit(X_train, y_train)
+
+```
+
+```{python rf_accuracy_l}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import pandas as pd
+from sklearn.model_selection import RandomizedSearchCV
+from scipy.stats import truncnorm, randint
+
+y_pred_rf = clf.predict(X_test)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_rf, y_test))
+print('Confusion Matrix for Random Forest for Low-Rated PCP:\n',classification_report(y_test, y_pred_rf))
+
+
+# #predict new data
+# y_pred_rf = clf.predict(X_test)
+# pred_rf = pd.DataFrame(y_pred_rf)
+# #pred_rf.describe
+# X_test['predictions_rf'] = y_pred_rf
+# 
+# #print out results
+# print('accuracy %s from Random Forest' % accuracy_score(y_pred_rf, y_test))
+# print(classification_report(y_test, y_pred_rf))
+
+# Using randomized searchCV for hyperparameter tuning
+# model_params = {
+#   # randomly sample numbers from 4 to 204 estimators
+#   'n_estimators': randint(4,200),
+#   # normally distributed max_features, with mean .25 stddev 0.1, bounded between 0 and 1
+#   #'max_features': truncnorm(a=0, b=1, loc=0.25, scale=0.1),
+#   'max_depth': randint(2,10)
+# }
+# 
+# # create random forest classifier model
+# rf_model = RandomForestClassifier()
+# 
+# # set up random search meta-estimator
+# # this will train 100 models over 5 folds of cross validation (500 models total)
+# clf = RandomizedSearchCV(rf_model, model_params, n_iter=100, cv=5, random_state=1)
+# 
+# # train the random search meta-estimator to find the best model out of 100 candidates
+# model = clf.fit(X_train, y_train)
+# 
+# # print winning set of hyperparameters
+# from pprint import pprint
+# pprint(model.best_estimator_.get_params())
+# 
+# #predict new data
+# y_pred_rf = model.predict(X_test)
+# 
+# #print out results
+# print('accuracy %s from Random Forest' % accuracy_score(y_pred_rf, y_test))
+# print(classification_report(y_test, y_pred_rf))
+
+```
+
+# SVM Classifier
+
+```{python data_svm_l}
+# from sklearn.model_selection import train_test_split
+# # Extract the topic probabilities from the main dataframe for independent variables
+# 
+# X = r.df_lowOB.iloc[:,9:13]
+# 
+# y = list(r.df_lowOB["Gender"])
+# 
+# df_lowOB = r.df_lowOB
+# 
+# X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state = 43, stratify = y)
+```
+
+```{python svm_classifier_l}
+from sklearn.svm import SVC
+
+svm_clf = SVC(gamma = 'auto')
+svm_clf = svm_clf.fit(X_train, y_train)
+```
+
+
+```{python svm_accuracy_l}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+#predict new data
+y_pred_svm = svm_clf.predict(X_test)
+
+#print out results
+print('accuracy %s from SVM' % accuracy_score(y_pred_svm, y_test))
+print(classification_report(y_test, y_pred_svm))
+```
+
+```{python data_xgb_l}
+# from sklearn.model_selection import train_test_split
+# Extract the topic probabilities from the main dataframe for independent variables
+
+X = r.df_lowOB.iloc[:,9:13]
+
+y = list(r.df_lowOB["Gender"])
+
+df_lowOB = r.df_lowOB
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state = 44, stratify = y)
+
+```
+
+```{python xgb_classifier_l}
+from sklearn.ensemble import GradientBoostingClassifier
+xgb_clf = GradientBoostingClassifier(n_estimators=100, learning_rate=1.0,max_depth=1, random_state=0)
+
+#print("Mean Accuracy", xgb_clf.score(X_test, y_test))
+xgb_clf = xgb_clf.fit(X_train, y_train)
+```
+
+```{python xgb_accuracy_l}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+#predict new data
+y_pred_xgb = xgb_clf.predict(X_test)
+pred_xgb = pd.DataFrame(y_pred_xgb)
+
+X_test['predictions_xgb'] = y_pred_xgb
+#print out results
+print('Accuracy %s from XGB' % accuracy_score(y_pred_xgb, y_test))
+print(classification_report(y_test, y_pred_xgb))
+```
+
+# Analysis of high-rated OBGYN doctors
+
+```{r topic_model_high, echo=FALSE}
+
+# Filter data for high rated doctors
+high_rating_ob <- ob[ob$avg_rating > 3, ]
+
+# Topic model for high-rated obgyn doctors
+ob_corpus_high_reviews <- corpus(high_rating_ob$Reviews)
+
+# Document frequency matrix
+dfmt_ob_high <- suppressWarnings(dfm(ob_corpus_high_reviews, remove = stopwordsPL,remove_number = TRUE, remove_punct=TRUE) %>%
+  dfm_remove(stopwords('english'), min_nchar = 2) %>%
+  dfm_trim(min_termfreq = 0.5, termfreq_type = "quantile",
+           max_docfreq = 0.1, docfreq_type = "prop"))
+print(dfmt_ob_high)
+topfeatures(dfmt_ob_high, 10)
+
+set.seed(5678) 
+
+# Call the seededlda function and pass the document feature matrix as well as the dictionary of seeded words
+# residual = TRUE means output the junk words that are grouped together as the 'other' topic 
+slda_ob_high <- textmodel_seededlda(dfmt_ob_high, seedwords_dict, beta = 0.5, residual = TRUE)
+
+# get theta values for terms per topic
+tidy_topics_ob_high <- as_tibble(slda_ob_high$theta, rownames = "Review")
+
+# Print top 20 terms per topic
+topic_terms_ob_high <- terms(slda_ob_high, 40)
+topic_terms_ob_high
+
+# Calculate the count of words per topic
+topic_ob_high <- table(topics(slda_ob_high))
+
+# build dataframe with topic probabilities to use for binary classification
+df_highOB <- as.data.frame(cbind(high_rating_ob, tidy_topics_ob_high))
+summary(df_highOB)
+```
+```{r}
+df_highOB$Gender = as.factor(df_highOB$Gender)
+logreg_coeff_h = glm(Gender~appearance+warmth+gendered+competence+other, data = df_highOB, family = 'binomial')
+summary(logreg_coeff_h)
+```
+
+# Split data into training and testing set
+
+```{python data_split}
+
+# Extract the topic probabilities from the main dataframe for independent variables
+
+X_high = r.df_highOB.iloc[:,9:13]
+
+y_high = list(r.df_highOB["Gender"])
+
+df_highOB = r.df_highOB
+ 
+X_train_h, X_test_h, y_train_h, y_test_h = train_test_split(X_high, y_high, test_size=0.20, random_state = 41, stratify = y_high)
+```
+# Logistic Regression on High-rated OBGYN
+
+```{python classifier}
+
+#build a log model
+
+logreg_h = LogisticRegression(solver='lbfgs', multi_class='auto', max_iter=1000)
+
+#fit the data to the log model
+logreg_h = logreg_h.fit(X_train_h, y_train_h)
+
+```
+
+```{python accuracy}
+
+import warnings
+warnings.filterwarnings("ignore")
+#predict new data
+y_pred_h = logreg.predict(X_test_h)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_h, y_test_h))
+print('Confusion Matrix for LogReg for High-Rated OBGYN:\n',classification_report(y_test_h, y_pred_h))
+```
+
+# Random Forest classifier for high-rated obgyn
+
+```{python data_rf_h}
+# from sklearn.model_selection import train_test_split
+# # Extract the topic probabilities from the main dataframe for independent variables
+# 
+# X = r.df_highOB.iloc[:,9:13]
+# 
+# y = list(r.df_highOB["Gender"])
+# 
+# df_highOB = r.df_highOB
+#  
+# X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state = 42, stratify = y)
+```
+
+```{python rf_classifier_h}
+from sklearn.ensemble import RandomForestClassifier
+
+rand_clf_h = RandomForestClassifier(max_depth=2, random_state=0, n_estimators = 100)
+rand_clf_h = rand_clf_h.fit(X_train_h, y_train_h)
+
+```
+
+```{python rf_h_metrics}
+
+#predict new data
+y_pred_rf_h = rand_clf_h.predict(X_test_h)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_rf_h, y_test_h))
+print('Confusion Matrix for Random Forest for High-Rated OBGYN:\n',classification_report(y_test_h, y_pred_rf_h))
+
+```
+# SVM Classifier for High-rated OBGYN
+
+```{python svm_classifier_h}
+svm_clf_h = SVC(gamma = 'auto')
+svm_clf_h = svm_clf_h.fit(X_train_h, y_train_h)
+```
+
+```{python svm_high_metrics}
+
+import warnings
+warnings.filterwarnings("ignore")
+
+#predict new data
+y_pred_svm_h = svm_clf_h.predict(X_test_h)
+
+#print out results
+print('accuracy %s' % accuracy_score(y_pred_svm_h, y_test_h))
+print('Confusion Matrix for SVM for High-Rated OBGYN:\n',classification_report(y_test_h, y_pred_svm_h))
+```
+
+```{python xgb_classifier_h}
+
+xgb_clf_h = GradientBoostingClassifier(n_estimators=100, learning_rate=1.0,max_depth=1, random_state=0)
+
+
+xgb_clf_h = xgb_clf_h.fit(X_train_h, y_train_h)
+```
+
+```{python xgb_accuracy_h}
+
+import warnings
+warnings.filterwarnings("ignore")
+
+#predict new data
+y_pred_xgb_h = xgb_clf_h.predict(X_test_h)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_xgb_h, y_test_h))
+print('Confusion Matrix for Gradient Boosting for High-Rated OBGYN:\n',classification_report(y_test_h, y_pred_xgb_h))
+```

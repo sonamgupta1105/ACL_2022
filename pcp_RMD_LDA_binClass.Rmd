@@ -1,0 +1,405 @@
+---
+title: "pcp_RMD_LDA_binClass"
+author: "Sonam Gupta"
+date: "9/6/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Traditional LDA on Low and High Rated PCP doctors
+
+```{r preprocess_data}
+library(quanteda)
+library(readr)
+library(BBmisc)
+library(dplyr)
+library(stringi)
+if(!require("topicmodels")) {install.packages("topicmodels"); library("topicmodels")}
+library(cld3)
+library(tm)
+library(tidytext)
+library(slam)
+
+# Read the data in
+rm_data <- read.csv("D:/Education/HbgUniv/PhD DS/Sex_bias_thesis/SexBias/Online_reviews/Multi-Aspect-Sentiment-Classification-for-Online-Medical-Reviews-main/RateMDs/Binary_classification_tm/rateMD_noDups.csv", stringsAsFactors = FALSE, encoding = 'Windows-1252')
+
+# Customized stopwords list used when building document term frequency matrix
+stopwordsPL <- readLines("D:/Education/HbgUniv/PhD DS/Sex_bias_thesis/SexBias/Online_reviews/Multi-Aspect-Sentiment-Classification-for-Online-Medical-Reviews-main/RateMDs/stopwords.txt", encoding = "UTF-8", warn = FALSE)
+
+rm_data$Reviews <- stri_remove_empty_na(rm_data$Reviews) #na.omit(rm_data$Reviews)
+rm_data$Gender <- stri_remove_empty_na(rm_data$Gender) #na.omit(rm_data$Gender)
+
+```
+
+# Filter the data for low rated PCP
+
+```{r filter_data}
+# Create a new column with average of P, H, K column scores
+rm_data$avg_rating <- rowMeans(rm_data[,c('Helpfulness', 'Knowledge')], na.rm=TRUE)
+
+# Create a subset for primary care doctors
+specialty <- c('family-gp', 'nurse-practitioner')
+pcp <- select(filter(rm_data, rm_data$Specialty == 'family-gp'| rm_data$Specialty == 'nurse-practitioner'), c('Doc_id', 'Doc_Name', 'Specialty','Gender', 'Helpfulness', 'Knowledge', 'Reviews', 'avg_rating'))
+
+low_rating_pcp <- pcp[pcp$avg_rating < 3, ]
+
+```
+
+# Build LDA model
+
+```{r LDA_low}
+
+# Topic model for low-rated primary care doctors
+
+pcp_corpus_low_reviews <- corpus(low_rating_pcp$Reviews)
+
+# Document frequency matrix
+dfmt_pcp_low <- suppressWarnings(dfm(pcp_corpus_low_reviews, remove = stopwordsPL,remove_number = TRUE, remove_punct=TRUE) %>%
+  dfm_remove(stopwords('english'), min_nchar = 2) %>%
+  dfm_trim(min_termfreq = 0.5, termfreq_type = "quantile",
+           max_docfreq = 0.1, docfreq_type = "prop"))
+print(dfmt_pcp_low)
+topfeatures(dfmt_pcp_low, 10)
+
+# Initialize number of topics
+k <- 5
+tmod_lda <- LDA(dfmt_pcp_low, k, method="Gibbs", control=list(iter = 500, seed = 1, verbose = 25))
+
+# Get top 10 topics:
+topic_terms_pcp<- terms(tmod_lda, 20)
+print('Top 20 words per topic for low-rated PCP: \n')
+print(topic_terms_pcp)
+
+# Get the posterior probabilities
+tmResult <- posterior(tmod_lda)
+tidy_topics_pcp_low <- tmResult$topics
+
+```
+
+```{r dfr, echo=FALSE}
+#r chunk
+library(reticulate)
+library(Rcpp)
+df_lowPCP <- as.data.frame(cbind(low_rating_pcp, tidy_topics_pcp_low))
+names(df_lowPCP)[names(df_lowPCP) == '1'] <- 'Topic1'
+names(df_lowPCP)[names(df_lowPCP) == '2'] <- 'Topic2'
+names(df_lowPCP)[names(df_lowPCP) == '3'] <- 'Topic3'
+names(df_lowPCP)[names(df_lowPCP) == '4'] <- 'Topic4'
+names(df_lowPCP)[names(df_lowPCP) == '5'] <- 'Topic5'
+summary(df_lowPCP)
+
+```
+
+# Coefficient Estimates for low-rated PCP
+
+```{r}
+df_lowPCP$Gender = as.factor(df_lowPCP$Gender)
+logreg_coeff = glm(Gender~Topic1+Topic2+Topic3+Topic4+Topic5, data = df_lowPCP, family = 'binomial')
+summary(logreg_coeff)
+```
+
+
+# Split data into training and testing set for low-rated doctors
+
+```{python data_split}
+from sklearn.model_selection import train_test_split
+# Extract the topic probabilities from the main dataframe for independent variables
+
+X = r.df_lowPCP.iloc[:,8:13]
+
+y = list(r.df_lowPCP["Gender"])
+
+df_lowPCP = r.df_lowPCP
+ 
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state = 30, stratify = y)
+```
+
+# Logistic Regression for Low-rated PCP
+
+```{python classifiers}
+
+#build a log model
+from sklearn.linear_model import LogisticRegression
+logreg = LogisticRegression(solver='lbfgs', multi_class='auto', max_iter=10000)
+
+#fit the data to the log model
+logreg = logreg.fit(X_train, y_train)
+
+```
+
+```{python metrics}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import pandas as pd
+import warnings
+warnings.filterwarnings("ignore")
+
+#predict new data
+y_pred_LR = logreg.predict(X_test)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_LR, y_test))
+print('Confusion Matrix for LogReg for Low-Rated PCP:\n', classification_report(y_test, y_pred_LR))
+```
+
+```{python rf_classifier}
+from sklearn.ensemble import RandomForestClassifier
+
+rand_clf = RandomForestClassifier(max_depth=2, random_state=0, n_estimators = 100)
+rand_clf = rand_clf.fit(X_train, y_train)
+
+```
+
+```{python rf_accuracy}
+#predict new data
+y_pred_rf = rand_clf.predict(X_test)
+
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_rf, y_test))
+print('Confusion Matrix for Random Forest for Low-Rated PCP:\n',classification_report(y_test, y_pred_rf))
+
+```
+
+
+```{python svm_classifier}
+from sklearn.svm import SVC
+
+svm_clf = SVC(gamma = 'auto')
+svm_clf = svm_clf.fit(X_train, y_train)
+```
+
+
+```{python svm_accuracy}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+
+#predict new data
+y_pred_svm = svm_clf.predict(X_test)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_svm, y_test))
+print('Confusion Matrix for SVM for Low-Rated PCP:\n',classification_report(y_test, y_pred_svm))
+```
+
+```{python xgb_classifier}
+from sklearn.ensemble import GradientBoostingClassifier
+xgb_clf = GradientBoostingClassifier(n_estimators=100, learning_rate=1.0,max_depth=1, random_state=0)
+
+#print("Mean Accuracy", xgb_clf.score(X_test, y_test))
+xgb_clf = xgb_clf.fit(X_train, y_train)
+```
+# Gradient Boosting Classifier for low-rated PCP
+
+```{python xgb_accuracy}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+
+#predict new data
+y_pred_xgb = xgb_clf.predict(X_test)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_xgb, y_test))
+print('Confusion Matrix for XGB for Low-Rated PCP:\n',classification_report(y_test, y_pred_xgb))
+```
+
+# Analyze the high rated PCP doctors Average Rating > 3
+
+```{r LDA_high}
+
+# Topic model for high-rated primary care doctors
+
+high_rating_pcp <- pcp[pcp$avg_rating > 3, ]
+
+pcp_corpus_high_reviews <- Corpus(VectorSource(high_rating_pcp$Reviews))#corpus(high_rating_pcp$Reviews)
+
+# Document frequency matrix
+# dfmt_pcp_high <- suppressWarnings(dfm(pcp_corpus_high_reviews, remove = stopwordsPL,remove_number = TRUE, remove_punct=TRUE) %>%
+#   dfm_remove(stopwords('english'), min_nchar = 2) %>%
+#   dfm_trim(min_termfreq = 0.5, termfreq_type = "quantile",
+#            max_docfreq = 0.1, docfreq_type = "prop"))
+# print(dfmt_pcp_high)
+# topfeatures(dfmt_pcp_high, 10)
+
+removeCommonTerms <- function (x, pct) 
+{
+    stopifnot(inherits(x, c("DocumentTermMatrix", "TermDocumentMatrix")), 
+        is.numeric(pct), pct > 0, pct < 1)
+    m <- if (inherits(x, "DocumentTermMatrix")) 
+        t(x)
+    else x
+    t <- table(m$i) < m$ncol * (pct)
+    termIndex <- as.numeric(names(t[t]))
+    if (inherits(x, "DocumentTermMatrix")) 
+        x[, termIndex]
+    else x[termIndex, ]
+}
+
+dfmt_pcp_high = 
+  DocumentTermMatrix(pcp_corpus_high_reviews,
+           control = list(stemming = TRUE, #create root words
+                          stopwords = TRUE, #remove stop words
+                          minWordLength = 3, #cut out small words
+                          removeNumbers = TRUE, #take out the numbers
+                          removePunctuation = TRUE)) #take out punctuation 
+removeCommonTerms(dfmt_pcp_high, .8)
+
+#weight the space
+import_weight = tapply(dfmt_pcp_high$v/row_sums(dfmt_pcp_high)[dfmt_pcp_high$i], 
+                       dfmt_pcp_high$j, 
+                       mean) *
+  log2(nDocs(dfmt_pcp_high)/col_sums(dfmt_pcp_high > 0))
+
+#ignore very frequent and 0 terms
+
+dfmt_pcp_high = dfmt_pcp_high[ row_sums(dfmt_pcp_high) > 0, ]
+
+# Remove missing values
+# dfmt_pcp_high <- stri_remove_empty_na(dfmt_pcp_high)
+
+# To avoid error: Each row of the input matrix needs to contain at least one non-zero entry.
+# raw.sum = apply(dfmt_pcp_high, 1, FUN = sum)
+# dfmt_pcp_high = dfmt_pcp_high[raw.sum > 0, ]
+
+# Initialize number of topics %>% 
+k <- 5
+tmod_lda_high <- LDA(dfmt_pcp_high, k, method="Gibbs", control=list(iter = 500, seed = 1, verbose = 25))
+
+# Get top 10 topics:
+topic_terms_pcp_high<- terms(tmod_lda_high, 20)
+print('Top 20 words per topic for high-rated PCP: \n')
+print(topic_terms_pcp_high)
+
+# Get the posterior probabilities
+tmResult_high <- posterior(tmod_lda_high)
+tidy_topics_pcp_high <- tmResult_high$topics
+
+
+```
+
+```{r dfr_high, echo=FALSE}
+library(reticulate)
+library(Rcpp)
+#df_highPCP <- merge(high_rating_pcp, tidy_topics_pcp_high)
+df_highPCP <- as.data.frame(cbind(high_rating_pcp, tidy_topics_pcp_high))
+names(df_highPCP)[names(df_highPCP) == '1'] <- 'Topic1'
+names(df_highPCP)[names(df_highPCP) == '2'] <- 'Topic2'
+names(df_highPCP)[names(df_highPCP) == '3'] <- 'Topic3'
+names(df_highPCP)[names(df_highPCP) == '4'] <- 'Topic4'
+names(df_highPCP)[names(df_highPCP) == '5'] <- 'Topic5'
+summary(df_highPCP)
+
+```
+# Coefficient Estimates for high-rated PCP
+
+```{r}
+df_highPCP$Gender = as.factor(df_highPCP$Gender)
+logreg_coeff_h_pcp = glm(Gender~Topic1+Topic2+Topic3+Topic4+Topic5, data = df_highPCP, family = 'binomial')
+summary(logreg_coeff_h_pcp)
+```
+
+```{python data_split_h}
+
+X_high = r.df_highPCP.iloc[:,8:13]
+
+y_high = list(r.df_highPCP["Gender"])
+
+df_highPCP = r.df_highPCP
+ 
+X_train_high, X_test_high, y_train_high, y_test_high = train_test_split(X_high, y_high, test_size=0.20, random_state = 31, stratify = y_high)
+```
+
+# Logistic Regression for Low-rated PCP
+
+```{python classifiers_high}
+
+#build a log model
+
+logreg_high = LogisticRegression(solver='lbfgs', multi_class='auto', max_iter=1000)
+
+#fit the data to the log model
+logreg_high = logreg_high.fit(X_train_high, y_train_high)
+
+```
+
+```{python metrics_high}
+
+#predict new data
+y_pred_LR_high = logreg_high.predict(X_test_high)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_LR_high, y_test_high))
+print('Confusion Matrix for LogReg for High-Rated PCP:\n', classification_report(y_test_high, y_pred_LR_high))
+```
+
+```{python rf_classifier_high}
+from sklearn.ensemble import RandomForestClassifier
+
+rand_clf_high = RandomForestClassifier(max_depth=2, random_state=0, n_estimators = 100)
+rand_clf_high = rand_clf_high.fit(X_train_high, y_train_high)
+
+```
+
+```{python rf_accuracy_high}
+#predict new data
+y_pred_rf_high = rand_clf_high.predict(X_test_high)
+
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_rf_high, y_test_high))
+print('Confusion Matrix for Random Forest for High-Rated PCP:\n',classification_report(y_test_high, y_pred_rf_high))
+
+```
+
+```{python svm_classifiers_high}
+from sklearn.svm import SVC
+
+svm_high = SVC(gamma = 'auto')
+svm_high = svm_high.fit(X_train_high, y_train_high)
+```
+
+```{python svm_accuracy_high}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+#predict new data
+y_pred_svm_high = svm_high.predict(X_test_high)
+
+#print out results
+print('accuracy %s' % accuracy_score(y_pred_svm_high, y_test_high))
+print('Confusion Matrix for LogReg for High-rated PCP:\n', classification_report(y_test_high, y_pred_svm_high))
+```
+
+# XGBclassifier for high-rated PCP
+
+```{python xgb_classifiers}
+from sklearn.ensemble import GradientBoostingClassifier
+xgb_high_clf = GradientBoostingClassifier(n_estimators=100, learning_rate=1.0,max_depth=1, random_state=0)
+
+xgb_high_clf = xgb_high_clf.fit(X_train_high, y_train_high)
+
+```
+
+```{python xgb_accuracy_high}
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+#predict new data
+y_pred_xgb_high = xgb_high_clf.predict(X_test_high)
+
+#print out results
+print('Accuracy %s' % accuracy_score(y_pred_xgb_high, y_test_high))
+print('Confusion Matrix for LogReg for High-rated PCP:\n', classification_report(y_test_high, y_pred_xgb_high))
+```
